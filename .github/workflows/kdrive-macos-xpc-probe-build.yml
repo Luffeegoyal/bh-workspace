@@ -1,0 +1,34 @@
+name: Build kDrive macOS XPC read-only probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'poc/kdrive_macos_xpc_readonly_probe.m'
+      - '.github/workflows/kdrive-macos-xpc-probe-build.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-only:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compile probe only
+        run: |
+          set -euo pipefail
+          clang \
+            -fobjc-arc \
+            -framework Foundation \
+            -Wall -Wextra -Werror \
+            -o /tmp/kdrive_macos_xpc_readonly_probe \
+            poc/kdrive_macos_xpc_readonly_probe.m
+          file /tmp/kdrive_macos_xpc_readonly_probe
+          otool -L /tmp/kdrive_macos_xpc_readonly_probe
+
+      - name: Safety assertion
+        run: |
+          echo 'Build-only workflow: the probe binary was NOT executed.'
