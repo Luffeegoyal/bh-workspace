@@ -1,28 +1,13 @@
-name: kDrive share canary cleanup
+name: kDrive share canary archive
 
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  cleanup:
+  archived:
     runs-on: ubuntu-latest
-    env:
-      KDRIVE_TOKEN: ${{ secrets.KDRIVE_TOKEN }}
     steps:
-      - name: Remove only controlled canary files
-        shell: python
-        run: |
-          import os, requests
-          token=os.environ.get('KDRIVE_TOKEN','')
-          if not token: raise SystemExit('missing token')
-          print(f'::add-mask::{token}')
-          h={'Authorization':f'Bearer {token}','User-Agent':'kDrive-YWH-cleanup/1.0 Infomaniak-YWH-Bugbounty','Accept':'application/json'}
-          for file_id in (17,18):
-              r=requests.delete(f'https://api.infomaniak.com/2/drive/3896576/files/{file_id}',headers=h,timeout=30)
-              try:o=r.json()
-              except Exception:o={}
-              print(f'[CLEANUP] file_id={file_id} HTTP={r.status_code} result={o.get("result")}')
+      - run: echo "Manual-only historical share-permission probe; canaries were cleaned up."
