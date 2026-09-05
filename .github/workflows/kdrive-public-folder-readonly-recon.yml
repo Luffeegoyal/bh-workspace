@@ -1,4 +1,4 @@
-name: kDrive public folder read-only recon
+name: kDrive public folder route inspection
 
 on:
   push:
@@ -8,112 +8,100 @@ permissions:
   contents: read
 
 jobs:
-  recon:
+  route-inspection:
     runs-on: ubuntu-latest
     env:
       KDRIVE_TOKEN: ${{ secrets.KDRIVE_TOKEN }}
     steps:
-      - name: Install browser dependencies
-        run: python -m pip install --quiet requests selenium
+      - name: Install dependency
+        run: python -m pip install --quiet requests
 
-      - name: Create controlled read-only public folder and inspect unauthenticated API traffic
+      - name: Inspect public frontend bundles without writing
         shell: python
         run: |
-          import base64, json, os, re, sys, time
-          from urllib.parse import urlparse
+          import html, json, os, re, sys
+          from urllib.parse import urljoin, urlparse
           import requests
-          from selenium import webdriver
-          from selenium.webdriver.chrome.options import Options
 
           token=os.environ.get('KDRIVE_TOKEN','')
           if not token: print('[STOP] missing token');sys.exit(2)
           print(f'::add-mask::{token}')
           drive_id=3896576
-          parent_id=5
+          folder_id=19
           ua='kDrive-YWH-public-folder-recon/1.0 Infomaniak-YWH-Bugbounty'
           auth={'Authorization':f'Bearer {token}','User-Agent':ua,'Accept':'application/json'}
-          now=int(time.time())
-          folder_name=f'ywh-public-readonly-{now}'
 
-          cr=requests.post(f'https://api.infomaniak.com/3/drive/{drive_id}/files/{parent_id}/directory',
-              headers={**auth,'Content-Type':'application/json'},json={'name':folder_name},timeout=30)
-          try: co=cr.json()
-          except Exception: print(f'[STOP] create HTTP={cr.status_code} non_json');sys.exit(0)
-          if co.get('result')!='success':
-              e=co.get('error') or {};print(f"[STOP] create HTTP={cr.status_code} code={e.get('code')}");sys.exit(0)
-          folder_id=(co.get('data') or {}).get('id')
-          print(f'[FOLDER] HTTP={cr.status_code} id={folder_id}')
-          if not folder_id: sys.exit(0)
-
-          sh=requests.post(f'https://api.infomaniak.com/2/drive/{drive_id}/files/{folder_id}/link',
-              headers={**auth,'Content-Type':'application/json'},
-              json={'right':'public','can_download':True,'can_edit':False,'can_request_access':False},timeout=30)
-          try: so=sh.json()
-          except Exception: print(f'[STOP] share HTTP={sh.status_code} non_json');sys.exit(0)
-          sd=so.get('data') or {};caps=sd.get('capabilities') or {};share_url=sd.get('url')
-          print(f"[SHARE] HTTP={sh.status_code} result={so.get('result')} can_edit={str(caps.get('can_edit')).lower()} can_download={str(caps.get('can_download')).lower()} right={sd.get('right')}")
-          if not share_url or caps.get('can_edit') is not False:
-              print('[STOP] no valid read-only public share');sys.exit(0)
+          meta=requests.get(f'https://api.infomaniak.com/3/drive/{drive_id}/files/{folder_id}',headers=auth,params={'with':'sharelink'},timeout=30)
+          try: mo=meta.json()
+          except Exception: print(f'[STOP] meta HTTP={meta.status_code} non_json');sys.exit(0)
+          sd=(mo.get('data') or {}).get('sharelink') or {}
+          share_url=sd.get('url') if isinstance(sd,dict) else None
+          caps=sd.get('capabilities') if isinstance(sd,dict) else {}
+          print(f"[POLICY] meta_HTTP={meta.status_code} can_edit={str((caps or {}).get('can_edit')).lower()}")
+          if not share_url:
+              print('[STOP] existing share URL unavailable');sys.exit(0)
           print(f'::add-mask::{share_url}')
 
-          def clean_path(path):
-              parts=[]
-              for seg in (path or '').split('/'):
-                  if not seg: continue
-                  if len(seg)>=20 or re.fullmatch(r'[0-9a-fA-F]{16,}',seg): parts.append('<redacted>')
-                  else: parts.append(seg)
-              return '/'+'/'.join(parts)
+          s=requests.Session();s.headers.update({'User-Agent':ua})
+          p=s.get(share_url,timeout=30,allow_redirects=True)
+          print(f'[PAGE] HTTP={p.status_code} host={urlparse(p.url).hostname} bytes={len(p.content)}')
+          if p.status_code!=200: sys.exit(0)
 
-          opts=Options();opts.add_argument('--headless=new');opts.add_argument('--no-sandbox');opts.add_argument('--disable-dev-shm-usage');opts.add_argument('--disable-gpu')
-          opts.set_capability('goog:loggingPrefs',{'performance':'ALL'})
-          driver=webdriver.Chrome(options=opts)
-          request_map={};seen=[];cap_observations=[]
-          try:
-              driver.execute_cdp_cmd('Network.enable',{})
-              driver.get(share_url)
-              time.sleep(8)
-              logs=driver.get_log('performance')
-              for entry in logs:
-                  try: msg=json.loads(entry['message'])['message']
-                  except Exception: continue
-                  method=msg.get('method'); p=msg.get('params') or {}
-                  if method=='Network.requestWillBeSent':
-                      req=p.get('request') or {};url=req.get('url') or '';rid=p.get('requestId');parsed=urlparse(url)
-                      headers={str(k).lower():str(v) for k,v in (req.get('headers') or {}).items()}
-                      request_map[rid]=(req.get('method'),parsed.hostname,clean_path(parsed.path),bool(headers.get('authorization')),bool(headers.get('cookie')))
-                      print(f'::add-mask::{url}')
-                  elif method=='Network.responseReceived':
-                      rid=p.get('requestId');resp=p.get('response') or {};url=resp.get('url') or '';parsed=urlparse(url)
-                      rtype=p.get('type') or '';status=int(resp.get('status') or 0)
-                      reqinfo=request_map.get(rid,('?',parsed.hostname,clean_path(parsed.path),False,False))
-                      if rtype in ('XHR','Fetch'):
-                          seen.append((reqinfo[0],parsed.hostname,clean_path(parsed.path),status,reqinfo[3],reqinfo[4]))
-                          if status==200:
-                              try:
-                                  rb=driver.execute_cdp_cmd('Network.getResponseBody',{'requestId':rid});raw=rb.get('body','')
-                                  if rb.get('base64Encoded'):raw=base64.b64decode(raw).decode('utf-8','ignore')
-                                  obj=json.loads(raw)
-                                  def walk(x,prefix=''):
-                                      if isinstance(x,dict):
-                                          for k,v in x.items():
-                                              lk=str(k).lower()
-                                              if isinstance(v,bool) and any(s in lk for s in ('edit','write','upload','create','delete','rename','move','download')):
-                                                  cap_observations.append((lk,v))
-                                              walk(v,prefix+'.'+str(k))
-                                      elif isinstance(x,list):
-                                          for v in x:walk(v,prefix)
-                                  walk(obj)
-                              except Exception:
-                                  pass
-          finally:
-              driver.quit()
+          # Collect script assets from the public page only.
+          srcs=[]
+          for m in re.finditer(r'<script[^>]+src=["\']([^"\']+)["\']',p.text,re.I):
+              u=urljoin(p.url,html.unescape(m.group(1)))
+              if urlparse(u).hostname==urlparse(p.url).hostname and u not in srcs:
+                  srcs.append(u)
+          print(f'[ASSETS] script_count={len(srcs)}')
 
-          print(f'[RECON] xhr_fetch_count={len(seen)}')
-          for i,(meth,host,path,status,has_auth,has_cookie) in enumerate(seen[:30],1):
-              print(f'[XHR {i}] method={meth} host={host} path={path} HTTP={status} authorization_header={str(has_auth).lower()} cookie_header={str(has_cookie).lower()}')
-          unique=[]
-          for item in cap_observations:
-              if item not in unique: unique.append(item)
-          for k,v in unique[:30]: print(f'[PUBLIC_CAP] {k}={str(v).lower()}')
-          print(f'[RESULT] CONTROLLED_FOLDER_ID={folder_id}')
-          print('[RESULT] READ_ONLY_RECON_COMPLETE_NO_ANON_WRITE_ATTEMPT')
+          patterns=[
+              ('cap_create_directory','can_create_directory'),
+              ('cap_upload','can_upload'),
+              ('directory_literal','/directory'),
+              ('share_files_literal','/share/'),
+              ('upload_literal','/upload'),
+          ]
+          hits=[]
+          for idx,u in enumerate(srcs[:12],1):
+              print(f'::add-mask::{u}')
+              try:r=s.get(u,timeout=30)
+              except Exception as e:
+                  print(f'[SCRIPT {idx}] error={type(e).__name__}');continue
+              text=r.text if r.status_code==200 else ''
+              local=[]
+              for label,needle in patterns:
+                  pos=text.find(needle)
+                  if pos>=0:
+                      local.append(label)
+                      # Print a very small sanitized context; long opaque values are removed.
+                      a=max(0,pos-180);b=min(len(text),pos+260)
+                      snippet=text[a:b].replace('\n',' ').replace('\r',' ')
+                      snippet=re.sub(r'[A-Za-z0-9_-]{28,}','<opaque>',snippet)
+                      snippet=re.sub(r'https?://[^"\'\s)]+','<url>',snippet)
+                      print(f'[HIT {idx} {label}] {snippet[:500]}')
+              if local:
+                  hits.append((idx,local))
+              print(f'[SCRIPT {idx}] HTTP={r.status_code} bytes={len(r.content)} hits={",".join(local) if local else "none"}')
+
+          # Search for likely route templates, without executing them.
+          route_fragments=[]
+          route_regexes=[
+              r'files[^"\']{0,80}directory',
+              r'share[^"\']{0,120}files[^"\']{0,80}directory',
+              r'files[^"\']{0,80}upload',
+          ]
+          for u in srcs[:12]:
+              try:t=s.get(u,timeout=30).text
+              except Exception:continue
+              for rx in route_regexes:
+                  for m in re.finditer(rx,t,re.I):
+                      frag=m.group(0)
+                      frag=re.sub(r'[A-Za-z0-9_-]{28,}','<opaque>',frag)
+                      if frag not in route_fragments:
+                          route_fragments.append(frag[:240])
+                      if len(route_fragments)>=20:break
+                  if len(route_fragments)>=20:break
+              if len(route_fragments)>=20:break
+          for i,f in enumerate(route_fragments,1):print(f'[ROUTE_FRAGMENT {i}] {f}')
+          print(f'[RESULT] ROUTE_INSPECTION_COMPLETE hits={len(hits)} fragments={len(route_fragments)} no_write_attempt=true')
