@@ -1,8 +1,6 @@
 name: kDrive Windows path canary
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
