@@ -1,0 +1,125 @@
+name: kDrive no-download share probe
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  share-probe:
+    runs-on: ubuntu-latest
+    env:
+      KDRIVE_TOKEN: ${{ secrets.KDRIVE_TOKEN }}
+    steps:
+      - name: Install dependency
+        run: python -m pip install --quiet requests
+
+      - name: Create controlled canary and no-download public share
+        shell: python
+        run: |
+          import json, os, sys, time
+          import requests
+
+          token = os.environ.get('KDRIVE_TOKEN', '')
+          if not token:
+              print('[STOP] missing KDRIVE_TOKEN'); sys.exit(2)
+          print(f'::add-mask::{token}')
+
+          drive_id = 3896576
+          directory_id = 5  # controlled /Private directory
+          ua = 'kDrive-YWH-share-canary/1.0 Infomaniak-YWH-Bugbounty'
+          auth = {
+              'Authorization': f'Bearer {token}',
+              'User-Agent': ua,
+              'Accept': 'application/json',
+          }
+
+          now = int(time.time())
+          body = f'KDRIVE-YWH-NODOWNLOAD-CANARY-{now}'.encode('utf-8')
+          filename = f'ywh-nodownload-canary-{now}.txt'
+
+          upload = requests.post(
+              f'https://api.infomaniak.com/3/drive/{drive_id}/upload',
+              headers={**auth, 'Content-Type': 'application/octet-stream'},
+              params={
+                  'directory_id': str(directory_id),
+                  'file_name': filename,
+                  'total_size': str(len(body)),
+                  'conflict': 'error',
+              },
+              data=body,
+              timeout=60,
+          )
+          print(f'[UPLOAD] HTTP={upload.status_code}')
+          try:
+              uo = upload.json()
+          except Exception:
+              print('[STOP] upload response non_json; body intentionally not printed'); sys.exit(0)
+          if uo.get('result') != 'success':
+              err = uo.get('error') or {}
+              print(f"[STOP] upload result={uo.get('result')} code={err.get('code')} reason={err.get('reason')}")
+              sys.exit(0)
+          ud = uo.get('data') or {}
+          file_id = ud.get('id')
+          print(f'[UPLOAD] result=success file_id={file_id} size={len(body)}')
+          if not file_id:
+              print('[STOP] upload returned no file id'); sys.exit(0)
+
+          share = requests.post(
+              f'https://api.infomaniak.com/2/drive/{drive_id}/files/{file_id}/link',
+              headers={**auth, 'Content-Type': 'application/json'},
+              json={
+                  'right': 'public',
+                  'can_download': False,
+                  'can_edit': False,
+                  'can_request_access': False,
+              },
+              timeout=60,
+          )
+          print(f'[SHARE] HTTP={share.status_code}')
+          try:
+              so = share.json()
+          except Exception:
+              print('[SHARE] non_json=true; body intentionally not printed'); sys.exit(0)
+          err = so.get('error') or {}
+          print(f"[SHARE] result={so.get('result')} code={err.get('code')} reason={err.get('reason')}")
+
+          def inspect(prefix, obj, depth=0):
+              if depth > 2:
+                  return
+              if isinstance(obj, dict):
+                  print(f'[{prefix}] keys=' + ','.join(sorted(str(k) for k in obj.keys())))
+                  for k, v in obj.items():
+                      lk = str(k).lower()
+                      if any(s in lk for s in ('url','token','hash','uuid','slug','secret','key','link')):
+                          if v is not None:
+                              print(f'[{prefix}] {k}=<redacted:{type(v).__name__}>')
+                      elif isinstance(v, bool):
+                          print(f'[{prefix}] {k}={str(v).lower()}')
+                      elif lk in ('right','type','visibility') and isinstance(v, (str,int)):
+                          print(f'[{prefix}] {k}={v}')
+                      elif isinstance(v, dict):
+                          inspect(prefix + '.' + str(k), v, depth + 1)
+              elif isinstance(obj, list):
+                  print(f'[{prefix}] list_count={len(obj)}')
+
+          inspect('SHAREOBJ', so)
+
+          meta = requests.get(
+              f'https://api.infomaniak.com/3/drive/{drive_id}/files/{file_id}',
+              headers=auth,
+              params={'with':'capabilities,sharelink'},
+              timeout=30,
+          )
+          print(f'[META] HTTP={meta.status_code}')
+          try:
+              mo = meta.json()
+              md = mo.get('data') or {}
+              inspect('METAOBJ', md)
+          except Exception:
+              print('[META] non_json=true')
+
+          print(f'[RESULT] CONTROLLED_FILE_ID={file_id}')
+          print('[RESULT] SHARE_URL_AND_TOKEN_NOT_PRINTED')
