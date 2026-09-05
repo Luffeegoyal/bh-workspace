@@ -53,7 +53,7 @@ jobs:
               print("[STOP] invalid drive_id/node_id input")
               sys.exit(4)
 
-          ua = "kDrive-YWH-view-authz/1.0 Infomaniak-YWH-Bugbounty"
+          ua = "kDrive-YWH-view-authz/1.1 Infomaniak-YWH-Bugbounty"
           headers = {
               "Authorization": f"Bearer {token}",
               "User-Agent": ua,
@@ -61,7 +61,8 @@ jobs:
           }
 
           # Fail closed: first prove that this exact controlled node is visible to
-          # the low-privilege principal while sharing/writing are explicitly denied.
+          # the low-privilege principal while public-link creation, sharing and
+          # writing are all explicitly denied by backend capabilities.
           meta_url = f"https://api.kdrive.infomaniak.com/3/drive/{drive_id}/files/{node_id}"
           meta = requests.get(meta_url, headers=headers, params={"with": "capabilities,sharelink"}, timeout=30)
           print(f"[PREFLIGHT] HTTP={meta.status_code}")
@@ -78,14 +79,32 @@ jobs:
 
           data = obj.get("data") or {}
           caps = data.get("capabilities") or {}
+          can_read = caps.get("can_read")
           can_share = caps.get("can_share")
           can_write = caps.get("can_write")
-          print(f"[CAPS] can_share={can_share!r} can_write={can_write!r}")
+          can_become_sharelink = caps.get("can_become_sharelink")
+          print(
+              "[CAPS] "
+              f"can_read={can_read!r} "
+              f"can_share={can_share!r} "
+              f"can_write={can_write!r} "
+              f"can_become_sharelink={can_become_sharelink!r}"
+          )
 
           # Require explicit booleans. Missing capability fields are inconclusive,
-          # not permission to proceed.
-          if can_share is not False or can_write is not False:
-              print("[STOP] exact node is not explicitly view-only (need can_share=false and can_write=false)")
+          # not permission to proceed. The node must be readable but explicitly
+          # forbidden from becoming a public share link.
+          if (
+              can_read is not True
+              or can_share is not False
+              or can_write is not False
+              or can_become_sharelink is not False
+          ):
+              print(
+                  "[STOP] exact node does not prove the required boundary "
+                  "(need can_read=true, can_share=false, can_write=false, "
+                  "can_become_sharelink=false)"
+              )
               sys.exit(0)
 
           existing = data.get("sharelink")
@@ -110,7 +129,7 @@ jobs:
           print(f"[RESULT] HTTP={resp.status_code} result={result!r} code={err.get('code')!r} reason={err.get('reason')!r}")
 
           if 200 <= resp.status_code < 300 and result == "success":
-              print("[SECURITY_SIGNAL] VIEW_ONLY_PRINCIPAL_CREATED_PUBLIC_LINK=true")
+              print("[SECURITY_SIGNAL] FORBIDDEN_PUBLIC_LINK_CREATION_SUCCEEDED=true")
               print("[ACTION] Revoke the canary public link from the owner account immediately after preserving minimal evidence.")
           elif resp.status_code in (401, 403):
               print("[SECURITY_SIGNAL] BACKEND_AUTHORIZATION_ENFORCED=true")
