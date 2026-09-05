@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  share-probe-stage2:
+  zip-share-probe:
     runs-on: ubuntu-latest
     env:
       KDRIVE_TOKEN: ${{ secrets.KDRIVE_TOKEN }}
@@ -16,160 +16,104 @@ jobs:
       - name: Install browser probe dependencies
         run: python -m pip install --quiet requests selenium
 
-      - name: Check public share for download-specific byte access
+      - name: Test non-preview ZIP share with download disabled
         shell: python
         run: |
-          import base64, json, os, re, sys, time
+          import base64, io, json, os, sys, time, zipfile
           from urllib.parse import urlparse
           import requests
           from selenium import webdriver
           from selenium.webdriver.chrome.options import Options
 
-          token = os.environ.get('KDRIVE_TOKEN', '')
-          if not token:
-              print('[STOP] missing KDRIVE_TOKEN'); sys.exit(2)
+          token=os.environ.get('KDRIVE_TOKEN','')
+          if not token: print('[STOP] missing token'); sys.exit(2)
           print(f'::add-mask::{token}')
+          drive_id=3896576
+          directory_id=5
+          ua='kDrive-YWH-share-canary/1.0 Infomaniak-YWH-Bugbounty'
+          auth={'Authorization':f'Bearer {token}','User-Agent':ua,'Accept':'application/json'}
 
-          drive_id = 3896576
-          file_id = 17
-          ua = 'kDrive-YWH-share-canary/1.0 Infomaniak-YWH-Bugbounty'
-          auth = {'Authorization': f'Bearer {token}', 'User-Agent': ua, 'Accept': 'application/json'}
+          now=int(time.time())
+          marker=f'KDRIVE-YWH-ZIP-NODOWNLOAD-{now}'.encode()
+          bio=io.BytesIO()
+          with zipfile.ZipFile(bio,'w',zipfile.ZIP_DEFLATED) as z:
+              z.writestr('canary.txt', marker)
+          payload=bio.getvalue()
+          filename=f'ywh-nodownload-binary-{now}.zip'
 
-          # Retrieve our controlled file and share metadata. Nothing sensitive is printed.
-          meta = requests.get(
-              f'https://api.infomaniak.com/3/drive/{drive_id}/files/{file_id}',
-              headers=auth, params={'with':'sharelink,capabilities'}, timeout=30)
-          print(f'[META] HTTP={meta.status_code}')
-          mo = meta.json() if meta.headers.get('content-type','').startswith('application/json') else {}
-          md = mo.get('data') or {}
-          sl = md.get('sharelink') or {}
-          share_url = sl.get('url') if isinstance(sl, dict) else None
-          caps = sl.get('capabilities') if isinstance(sl, dict) else None
-          if isinstance(caps, dict):
-              print(f"[POLICY] can_download={str(caps.get('can_download')).lower()} can_edit={str(caps.get('can_edit')).lower()}")
-          if not share_url:
-              # Fallback to the documented v2 share-link resource.
-              gr = requests.get(f'https://api.infomaniak.com/2/drive/{drive_id}/files/{file_id}/link', headers=auth, timeout=30)
-              try:
-                  gd = (gr.json().get('data') or {})
-                  share_url = gd.get('url')
-                  caps = gd.get('capabilities') or caps
-              except Exception:
-                  pass
-          if not share_url:
-              print('[STOP] could not retrieve existing share URL'); sys.exit(0)
+          up=requests.post(f'https://api.infomaniak.com/3/drive/{drive_id}/upload',
+              headers={**auth,'Content-Type':'application/zip'},
+              params={'directory_id':str(directory_id),'file_name':filename,'total_size':str(len(payload)),'conflict':'error'},
+              data=payload,timeout=60)
+          try: uo=up.json()
+          except Exception: print(f'[STOP] upload HTTP={up.status_code} non_json');sys.exit(0)
+          if uo.get('result')!='success':
+              e=uo.get('error') or {};print(f"[STOP] upload HTTP={up.status_code} result={uo.get('result')} code={e.get('code')}");sys.exit(0)
+          file_id=(uo.get('data') or {}).get('id')
+          print(f'[UPLOAD] HTTP={up.status_code} file_id={file_id} zip_bytes={len(payload)}')
+          if not file_id: sys.exit(0)
+
+          sh=requests.post(f'https://api.infomaniak.com/2/drive/{drive_id}/files/{file_id}/link',
+              headers={**auth,'Content-Type':'application/json'},
+              json={'right':'public','can_download':False,'can_edit':False,'can_request_access':False},timeout=60)
+          try: so=sh.json()
+          except Exception: print(f'[STOP] share HTTP={sh.status_code} non_json');sys.exit(0)
+          sd=so.get('data') or {}; caps=sd.get('capabilities') or {}; share_url=sd.get('url')
+          print(f"[SHARE] HTTP={sh.status_code} result={so.get('result')} can_download={str(caps.get('can_download')).lower()} right={sd.get('right')}")
+          if not share_url or caps.get('can_download') is not False:
+              print('[STOP] no valid no-download public share');sys.exit(0)
           print(f'::add-mask::{share_url}')
           print(f'[SHARE] host={urlparse(share_url).hostname} url_redacted=true')
 
-          # Get exact bytes for our own canary via authenticated owner API solely as comparison baseline.
-          owner = requests.get(f'https://api.infomaniak.com/2/drive/{drive_id}/files/{file_id}/download', headers=auth,
-                               timeout=60, allow_redirects=True)
-          expected = owner.content
-          print(f'[OWNER_BASELINE] HTTP={owner.status_code} bytes={len(expected)}')
-          if owner.status_code != 200 or not expected:
-              print('[STOP] could not establish owner byte baseline'); sys.exit(0)
-
-          # Basic unauthenticated page load.
-          public_session = requests.Session()
-          public_session.headers.update({'User-Agent': ua})
-          page = public_session.get(share_url, timeout=30, allow_redirects=True)
-          for h in page.history:
-              loc = h.headers.get('Location')
-              if loc: print(f'::add-mask::{loc}')
-          print(f'[PUBLIC_PAGE] HTTP={page.status_code} final_host={urlparse(page.url).hostname} content_type={page.headers.get("content-type","").split(";")[0]} bytes={len(page.content)}')
-
-          # Load the share normally in a clean, unauthenticated browser and inspect only its own requests.
-          opts = Options()
-          opts.add_argument('--headless=new')
-          opts.add_argument('--no-sandbox')
-          opts.add_argument('--disable-dev-shm-usage')
-          opts.add_argument('--disable-gpu')
-          opts.set_capability('goog:loggingPrefs', {'performance':'ALL'})
-          driver = webdriver.Chrome(options=opts)
-          candidate_urls = set()
-          response_summary = []
+          opts=Options()
+          opts.add_argument('--headless=new');opts.add_argument('--no-sandbox');opts.add_argument('--disable-dev-shm-usage');opts.add_argument('--disable-gpu')
+          opts.set_capability('goog:loggingPrefs',{'performance':'ALL'})
+          driver=webdriver.Chrome(options=opts)
+          exact_download=False
+          saw_download_200=False
+          observations=[]
           try:
-              driver.execute_cdp_cmd('Network.enable', {})
+              driver.execute_cdp_cmd('Network.enable',{})
               driver.get(share_url)
-              time.sleep(7)
-              logs = driver.get_log('performance')
+              time.sleep(8)
+              logs=driver.get_log('performance')
               for entry in logs:
-                  try:
-                      msg = json.loads(entry['message'])['message']
-                  except Exception:
-                      continue
-                  if msg.get('method') != 'Network.responseReceived':
-                      continue
-                  p = msg.get('params') or {}
-                  resp = p.get('response') or {}
-                  url = resp.get('url') or ''
-                  parsed = urlparse(url)
-                  host = parsed.hostname or ''
-                  path = parsed.path or ''
-                  status = int(resp.get('status') or 0)
-                  mime = resp.get('mimeType') or ''
-                  headers = {str(k).lower(): str(v) for k,v in (resp.get('headers') or {}).items()}
-                  disp = headers.get('content-disposition','')
-                  keyword = any(k in path.lower() for k in ('download','export','raw'))
-                  if keyword:
-                      candidate_urls.add(url)
-                      print(f'::add-mask::{url}')
-                      response_summary.append((host, status, mime, bool(disp), 'download-keyword'))
-
-                  # Examine small XHR/fetch JSON bodies for download-specific URLs without logging the body.
-                  rtype = p.get('type') or ''
-                  if rtype in ('XHR','Fetch') and status == 200:
-                      rid = p.get('requestId')
+                  try: msg=json.loads(entry['message'])['message']
+                  except Exception: continue
+                  if msg.get('method')!='Network.responseReceived': continue
+                  p=msg.get('params') or {}; resp=p.get('response') or {}; url=resp.get('url') or ''
+                  parsed=urlparse(url); path=(parsed.path or '').lower(); status=int(resp.get('status') or 0)
+                  if 'download' not in path: continue
+                  print(f'::add-mask::{url}')
+                  headers={str(k).lower():str(v) for k,v in (resp.get('headers') or {}).items()}
+                  disp=headers.get('content-disposition','')
+                  mime=resp.get('mimeType') or ''
+                  body_match=False; body_len=-1
+                  if status==200:
+                      saw_download_200=True
+                      rid=p.get('requestId')
                       try:
-                          b = driver.execute_cdp_cmd('Network.getResponseBody', {'requestId': rid})
-                          raw = b.get('body','')
-                          if b.get('base64Encoded'):
-                              raw = base64.b64decode(raw).decode('utf-8','ignore')
-                          if len(raw) <= 1000000:
-                              try:
-                                  obj = json.loads(raw)
-                              except Exception:
-                                  obj = None
-                              def walk(x):
-                                  if isinstance(x, dict):
-                                      for k,v in x.items():
-                                          lk = str(k).lower()
-                                          if isinstance(v, str) and ('download' in lk or '/download' in v.lower()):
-                                              if v.startswith('http://') or v.startswith('https://'):
-                                                  candidate_urls.add(v); print(f'::add-mask::{v}')
-                                          walk(v)
-                                  elif isinstance(x, list):
-                                      for v in x: walk(v)
-                              if obj is not None: walk(obj)
+                          rb=driver.execute_cdp_cmd('Network.getResponseBody',{'requestId':rid})
+                          raw=rb.get('body','')
+                          if rb.get('base64Encoded'):
+                              b=base64.b64decode(raw)
+                          else:
+                              b=raw.encode('utf-8')
+                          body_len=len(b);body_match=(b==payload)
+                          if body_match: exact_download=True
                       except Exception:
                           pass
+                  observations.append((parsed.hostname,status,mime,'attachment' in disp.lower(),body_len,body_match))
           finally:
               driver.quit()
 
-          print(f'[BROWSER] download_specific_candidates={len(candidate_urls)}')
-          for host,status,mime,has_disp,label in response_summary[:10]:
-              print(f'[NETWORK] host={host} status={status} mime={mime} content_disposition_present={str(has_disp).lower()} class={label}')
+          print(f'[BROWSER] download_responses={len(observations)} saw_download_200={str(saw_download_200).lower()} exact_zip_bytes={str(exact_download).lower()}')
+          for i,(host,status,mime,attachment,body_len,match) in enumerate(observations[:10],1):
+              print(f'[NETWORK {i}] host={host} HTTP={status} mime={mime} attachment={str(attachment).lower()} captured_bytes={body_len} exact_zip={str(match).lower()}')
 
-          # Test at most three download-specific URLs discovered by the public page, with NO Authorization/cookies.
-          confirmed = False
-          tested = 0
-          for candidate in list(candidate_urls)[:3]:
-              tested += 1
-              try:
-                  r = requests.get(candidate, headers={'User-Agent': ua}, timeout=60, allow_redirects=True)
-              except Exception as e:
-                  print(f'[CANDIDATE {tested}] request_error={type(e).__name__}')
-                  continue
-              exact = (r.status_code == 200 and r.content == expected)
-              disp = r.headers.get('Content-Disposition','')
-              final_host = urlparse(r.url).hostname
-              print(f'[CANDIDATE {tested}] HTTP={r.status_code} final_host={final_host} bytes={len(r.content)} exact_owner_bytes={str(exact).lower()} attachment={str("attachment" in disp.lower()).lower()}')
-              if exact:
-                  confirmed = True
-
-          if confirmed:
-              print('[RESULT] POTENTIAL_NODOWNLOAD_BYPASS_EXACT_BYTES_VIA_DOWNLOAD_SPECIFIC_URL')
-          elif candidate_urls:
-              print('[RESULT] DOWNLOAD_SPECIFIC_URLS_FOUND_BUT_NO_EXACT_BYTE_BYPASS')
+          if exact_download:
+              print('[RESULT] STRONG_NODOWNLOAD_BYPASS_BROWSER_RECEIVED_EXACT_ZIP_BYTES')
+          elif saw_download_200:
+              print('[RESULT] DOWNLOAD_ENDPOINT_USED_BUT_EXACT_ZIP_BODY_NOT_CONFIRMED')
           else:
-              print('[RESULT] NO_DOWNLOAD_SPECIFIC_PUBLIC_ENDPOINT_DISCOVERED')
+              print('[RESULT] NO_DOWNLOAD_ENDPOINT_SUCCESS_FOR_ZIP')
