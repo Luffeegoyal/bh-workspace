@@ -1,0 +1,82 @@
+name: kDrive backend symlink negative controls
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  negative-controls:
+    runs-on: ubuntu-latest
+    env:
+      KDRIVE_TOKEN: ${{ secrets.KDRIVE_TOKEN }}
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests xxhash
+
+      - name: Verify obvious escaping targets are rejected
+        shell: python
+        run: |
+          import json, os, sys, time
+          import requests, xxhash
+
+          token = os.environ.get("KDRIVE_TOKEN", "")
+          if not token:
+              print("[STOP] missing KDRIVE_TOKEN")
+              sys.exit(2)
+          print(f"::add-mask::{token}")
+          ua = "kDrive-YWH-canary/1.0 Infomaniak-YWH-Bugbounty"
+          auth = {"Authorization": f"Bearer {token}", "User-Agent": ua, "Accept": "application/json"}
+
+          r = requests.get(
+              "https://api.kdrive.infomaniak.com/2/drive/users/current/drives",
+              headers=auth,
+              params=[("roles[]","admin"),("roles[]","user"),("with","drive,drive.account")],
+              timeout=30,
+          )
+          obj = r.json()
+          ids = sorted({int(x["drive_id"]) for x in (obj.get("data") or []) if x.get("drive_id") is not None})
+          print(f"[DRIVES] HTTP={r.status_code} count={len(ids)} ids={ids}")
+          if r.status_code != 200 or obj.get("result") != "success" or len(ids) != 1:
+              print("[STOP] expected exactly one controlled drive")
+              sys.exit(3)
+          drive_id = ids[0]
+
+          cases = [
+              ("absolute-drive", r"C:\kdrive-bounty-canary-target"),
+              ("parent-traversal", r"..\kdrive-bounty-canary-target"),
+          ]
+          for label, target in cases:
+              now = int(time.time())
+              body = target.encode()
+              params = {
+                  "file_name": f"ywh-negative-{label}-{now}",
+                  "directory_id": "1",
+                  "created_at": str(now),
+                  "conflict": "error",
+                  "total_size": str(len(body)),
+                  "total_chunk_hash": "xxh3:" + xxhash.xxh3_64_hexdigest(body).lower(),
+                  "last_modified_at": str(now),
+                  "symbolic_link": target,
+              }
+              h = {
+                  "Authorization": f"Bearer {token}",
+                  "User-Agent": ua,
+                  "Content-Type": "inode/folder-symlink",
+                  "Accept": "application/json",
+              }
+              u = requests.post(
+                  f"https://api.kdrive.infomaniak.com/2/drive/{drive_id}/upload",
+                  headers=h, params=params, data=body, timeout=60,
+              )
+              try:
+                  o = u.json()
+              except Exception:
+                  print(f"[CONTROL {label}] HTTP={u.status_code} non_json=true")
+                  continue
+              err = o.get("error") or {}
+              blob = json.dumps(o)
+              print(f"[CONTROL {label}] HTTP={u.status_code} result={o.get('result')} code={err.get('code')} validation_rule_hit={'validation_rule_symbolic_link_target_rule' in blob}")
