@@ -1,4 +1,4 @@
-name: kDrive public folder route inspection
+name: kDrive public folder exact route inspection
 
 on:
   push:
@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  route-inspection:
+  exact-route:
     runs-on: ubuntu-latest
     env:
       KDRIVE_TOKEN: ${{ secrets.KDRIVE_TOKEN }}
@@ -16,92 +16,75 @@ jobs:
       - name: Install dependency
         run: python -m pip install --quiet requests
 
-      - name: Inspect public frontend bundles without writing
+      - name: Resolve public route templates without writing
         shell: python
         run: |
-          import html, json, os, re, sys
+          import html, os, re, sys
           from urllib.parse import urljoin, urlparse
           import requests
 
           token=os.environ.get('KDRIVE_TOKEN','')
           if not token: print('[STOP] missing token');sys.exit(2)
           print(f'::add-mask::{token}')
-          drive_id=3896576
-          folder_id=19
+          drive_id=3896576; folder_id=19
           ua='kDrive-YWH-public-folder-recon/1.0 Infomaniak-YWH-Bugbounty'
           auth={'Authorization':f'Bearer {token}','User-Agent':ua,'Accept':'application/json'}
 
           meta=requests.get(f'https://api.infomaniak.com/3/drive/{drive_id}/files/{folder_id}',headers=auth,params={'with':'sharelink'},timeout=30)
-          try: mo=meta.json()
-          except Exception: print(f'[STOP] meta HTTP={meta.status_code} non_json');sys.exit(0)
-          sd=(mo.get('data') or {}).get('sharelink') or {}
-          share_url=sd.get('url') if isinstance(sd,dict) else None
-          caps=sd.get('capabilities') if isinstance(sd,dict) else {}
-          print(f"[POLICY] meta_HTTP={meta.status_code} can_edit={str((caps or {}).get('can_edit')).lower()}")
-          if not share_url:
-              print('[STOP] existing share URL unavailable');sys.exit(0)
+          mo=meta.json(); sd=(mo.get('data') or {}).get('sharelink') or {}
+          share_url=sd.get('url'); caps=sd.get('capabilities') or {}
+          print(f"[POLICY] can_edit={str(caps.get('can_edit')).lower()}")
+          if not share_url: print('[STOP] no share URL');sys.exit(0)
           print(f'::add-mask::{share_url}')
 
           s=requests.Session();s.headers.update({'User-Agent':ua})
-          p=s.get(share_url,timeout=30,allow_redirects=True)
-          print(f'[PAGE] HTTP={p.status_code} host={urlparse(p.url).hostname} bytes={len(p.content)}')
-          if p.status_code!=200: sys.exit(0)
-
-          # Collect script assets from the public page only.
+          p=s.get(share_url,timeout=30)
           srcs=[]
           for m in re.finditer(r'<script[^>]+src=["\']([^"\']+)["\']',p.text,re.I):
               u=urljoin(p.url,html.unescape(m.group(1)))
-              if urlparse(u).hostname==urlparse(p.url).hostname and u not in srcs:
-                  srcs.append(u)
+              if urlparse(u).hostname==urlparse(p.url).hostname and u not in srcs:srcs.append(u)
           print(f'[ASSETS] script_count={len(srcs)}')
 
-          patterns=[
-              ('cap_create_directory','can_create_directory'),
-              ('cap_upload','can_upload'),
-              ('directory_literal','/directory'),
-              ('share_files_literal','/share/'),
-              ('upload_literal','/upload'),
-          ]
-          hits=[]
-          for idx,u in enumerate(srcs[:12],1):
+          needles=['apiUrlV3Public','apiUrlV2Public','publicBaseUrl(i,r)','publicBaseUrl','createFolder(i,r','/files/${r}/directory','/directory`']
+          found=0
+          for idx,u in enumerate(srcs[:6],1):
               print(f'::add-mask::{u}')
-              try:r=s.get(u,timeout=30)
-              except Exception as e:
-                  print(f'[SCRIPT {idx}] error={type(e).__name__}');continue
-              text=r.text if r.status_code==200 else ''
-              local=[]
-              for label,needle in patterns:
-                  pos=text.find(needle)
-                  if pos>=0:
-                      local.append(label)
-                      # Print a very small sanitized context; long opaque values are removed.
-                      a=max(0,pos-180);b=min(len(text),pos+260)
-                      snippet=text[a:b].replace('\n',' ').replace('\r',' ')
-                      snippet=re.sub(r'[A-Za-z0-9_-]{28,}','<opaque>',snippet)
-                      snippet=re.sub(r'https?://[^"\'\s)]+','<url>',snippet)
-                      print(f'[HIT {idx} {label}] {snippet[:500]}')
-              if local:
-                  hits.append((idx,local))
-              print(f'[SCRIPT {idx}] HTTP={r.status_code} bytes={len(r.content)} hits={",".join(local) if local else "none"}')
+              r=s.get(u,timeout=30)
+              if r.status_code!=200:continue
+              t=r.text
+              for needle in needles:
+                  start=0
+                  while True:
+                      pos=t.find(needle,start)
+                      if pos<0:break
+                      a=max(0,pos-360);b=min(len(t),pos+700)
+                      sn=t[a:b].replace('\n',' ').replace('\r',' ')
+                      sn=re.sub(r'https?://[^"\'\s)]+','<url>',sn)
+                      sn=re.sub(r'[A-Za-z0-9_-]{40,}','<opaque>',sn)
+                      print(f'[CONTEXT {idx} {needle}] {sn[:1100]}')
+                      found+=1; start=pos+len(needle)
+                      if found>=30:break
+                  if found>=30:break
+              if found>=30:break
 
-          # Search for likely route templates, without executing them.
-          route_fragments=[]
-          route_regexes=[
-              r'files[^"\']{0,80}directory',
-              r'share[^"\']{0,120}files[^"\']{0,80}directory',
-              r'files[^"\']{0,80}upload',
-          ]
-          for u in srcs[:12]:
+          # Explicitly pull likely URL-base definitions surrounding apiUrlV3Public/publicBaseUrl.
+          route_candidates=[]
+          for u in srcs[:6]:
               try:t=s.get(u,timeout=30).text
               except Exception:continue
-              for rx in route_regexes:
-                  for m in re.finditer(rx,t,re.I):
-                      frag=m.group(0)
-                      frag=re.sub(r'[A-Za-z0-9_-]{28,}','<opaque>',frag)
-                      if frag not in route_fragments:
-                          route_fragments.append(frag[:240])
-                      if len(route_fragments)>=20:break
-                  if len(route_fragments)>=20:break
-              if len(route_fragments)>=20:break
-          for i,f in enumerate(route_fragments,1):print(f'[ROUTE_FRAGMENT {i}] {f}')
-          print(f'[RESULT] ROUTE_INSPECTION_COMPLETE hits={len(hits)} fragments={len(route_fragments)} no_write_attempt=true')
+              for rx in [
+                  r'apiUrlV3Public[^,;}]{0,240}',
+                  r'publicBaseUrl\([^)]*\)\{return[^}]{0,350}\}',
+                  r'createFolder\([^)]*\)\{[^}]{0,700}\}',
+                  r'apiUrlV3[^,;}]{0,180}',
+              ]:
+                  for m in re.finditer(rx,t):
+                      x=m.group(0).replace('\n',' ')
+                      x=re.sub(r'https?://[^"\'\s)]+','<url>',x)
+                      x=re.sub(r'[A-Za-z0-9_-]{40,}','<opaque>',x)
+                      if x not in route_candidates:route_candidates.append(x[:900])
+                      if len(route_candidates)>=30:break
+                  if len(route_candidates)>=30:break
+              if len(route_candidates)>=30:break
+          for i,x in enumerate(route_candidates,1):print(f'[ROUTE {i}] {x}')
+          print(f'[RESULT] EXACT_ROUTE_INSPECTION_COMPLETE contexts={found} route_candidates={len(route_candidates)} no_write_attempt=true')
