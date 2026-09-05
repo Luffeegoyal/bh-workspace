@@ -1,0 +1,49 @@
+name: kDrive Windows path canary
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  windows-path-canary:
+    runs-on: windows-latest
+    steps:
+      - name: Test Windows root-relative symlink semantics
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $target = 'C:\kdrive-bounty-canary-target'
+          $sync = 'C:\kdrive-sync\bounty-test'
+          $link = Join-Path $sync 'outside-link'
+
+          New-Item -ItemType Directory -Force -Path $target | Out-Null
+          New-Item -ItemType Directory -Force -Path $sync | Out-Null
+          Set-Content -Path (Join-Path $target 'proof.txt') -Value 'KDRIVE-BOUNTY-CANARY'
+
+          Write-Host "[PATH] Target literal: \kdrive-bounty-canary-target"
+          Write-Host "[PATH] IsPathRooted: $([System.IO.Path]::IsPathRooted('\kdrive-bounty-canary-target'))"
+          Write-Host "[PATH] GetFullPath: $([System.IO.Path]::GetFullPath('\kdrive-bounty-canary-target'))"
+
+          try {
+            New-Item -ItemType SymbolicLink -Path $link -Target '\kdrive-bounty-canary-target' -Force | Out-Null
+          } catch {
+            Write-Host "[SYMLINK_CREATE_ERROR] $($_.Exception.Message)"
+            exit 2
+          }
+
+          $item = Get-Item -LiteralPath $link -Force
+          Write-Host "[LINK] FullName: $($item.FullName)"
+          Write-Host "[LINK] Target: $($item.Target)"
+          Write-Host "[LINK] LinkType: $($item.LinkType)"
+
+          $proofViaLink = Join-Path $link 'proof.txt'
+          Write-Host "[RESOLVE] $((Resolve-Path -LiteralPath $proofViaLink).Path)"
+          $content = Get-Content -LiteralPath $proofViaLink -Raw
+          Write-Host "[CONTENT] $($content.Trim())"
+
+          if ($content.Trim() -ne 'KDRIVE-BOUNTY-CANARY') {
+            throw 'Root-relative symlink did not reach the root-level canary target.'
+          }
+
+          Write-Host '[RESULT] CONFIRMED: \target resolves outside C:\kdrive-sync and is followed as a Windows symlink target.'
